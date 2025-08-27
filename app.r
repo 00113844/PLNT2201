@@ -6,6 +6,10 @@ library(shiny)
 library(prosail)
 library(ggplot2)
 
+# Silence R CMD check notes for NSE/global data objects when packaging/sharing
+if (getRversion() >= "2.15.1") utils::globalVariables(c(
+  "SpecSOIL", "SpecPROSPECT_FullRange", "refl", "LAI", "trans"))
+
 ui <- fluidPage(
   titlePanel("Retrieve canopy extinction k from PRO4SAIL (population → LAI → absorptance → k)"),
   sidebarLayout(
@@ -36,21 +40,94 @@ ui <- fluidPage(
       actionButton("run", "Run PRO4SAIL")
     ),
     mainPanel(
-      h4("Results"),
-      verbatimTextOutput("summary"),
+      # Results moved to bottom; start with solar helper
+      hr(),
+      h4("Solar position helper (compute SZA)"),
+      fluidRow(
+        column(4, dateInput("date_local", "Date", value = Sys.Date())),
+        column(2, sliderInput("hour_local", "Hour", min = 0, max = 23, value = 12)),
+        column(2, sliderInput("minute_local", "Minute", min = 0, max = 59, value = 0)),
+        column(4, numericInput("lat", "Latitude (deg, N positive; Perth -31.95)", value = -31.95, step = 0.01))
+      ),
+      fluidRow(
+        column(4, numericInput("lon", "Longitude (deg, E positive; Perth 115.86)", value = 115.86, step = 0.01)),
+        column(4, numericInput("tz_offset", "UTC offset hours", value = 8, step = 1)),
+        column(4, actionButton("calc_sza", "Compute solar zenith"))
+      ),
+      helpText("Uses NOAA solar position formula (eqn of time + declination) to derive solar zenith; updates SZA slider used in PRO4SAIL."),
+      verbatimTextOutput("solar_pos"),
+      hr(),
+      h4("Field measurement mode (optional)"),
+      fluidRow(
+        column(3, numericInput("Io_field", HTML("I<sub>0</sub> (incoming above canopy)"), value = NA, min = 0)),
+        column(3, numericInput("Ir_field", HTML("I<sub>r</sub> (reflected above canopy)"), value = NA, min = 0)),
+        column(3, numericInput("Ic_field", HTML("I<sub>c</sub> (transmitted below canopy)"), value = NA, min = 0)),
+        column(3, numericInput("LAI_field", "LAI (measured)", value = NA, min = 0))
+      ),
+      verbatimTextOutput("field_calc"),
       fluidRow(
         column(6, plotOutput("specPlot", height = "320px")),
         column(6, plotOutput("kLAIPlot", height = "320px"))
       ),
       hr(),
-      h5("Notes"),
-      p("k is computed as k = -ln(I_t) / LAI using beam transmittance estimate from PRO4SAIL (beam_trans = 1 - fcover)."),
-      p("If spectral reflectance rsdt is available, the app also computes I_r (reflectance over PAR) and recomputes I_t = 1 - I_r - I_abs for cross-check.")
+  h4("Results"),
+  verbatimTextOutput("summary"),
+  hr(),
+  h5("Notes"),
+  p("Beer–Lambert canopy form: F = 1 - exp(-k * LAI); here F ~ fcover (fractional cover) or fAPAR (fraction of absorbed PAR)."),
+  p("Transmittance T = exp(-k*LAI). We solve k = -ln(T)/LAI with T chosen as (1 - fcover) or (1 - fAPAR)."),
+  p("Absorptance spectra: A(λ) = 1 - R(λ) - T(λ) when both reflectance and transmittance are available; no assumption that A = 1 - R."),
+  p("k can exceed 1 at high solar zenith angles or strongly planophile canopies; lower values occur in erectophile canopies."),
+  p(HTML("Field method: Transmission I<sub>c</sub>; Intercepted fraction F = I<sub>im</sub> = ((I<sub>0</sub> - I<sub>r</sub>) - I<sub>c</sub>)/I<sub>0</sub>. Beer–Lambert with reflection accounted: I<sub>c</sub> = (I<sub>0</sub>-I<sub>r</sub>) exp(-k LAI). Thus k = -ln(I<sub>c</sub>/(I<sub>0</sub>-I<sub>r</sub>))/LAI."))
     )
   )
 )
 
 server <- function(input, output, session) {
+
+  # Compute solar position (solar zenith) using NOAA algorithm when button pressed
+  observeEvent(input$calc_sza, {
+    req(input$date_local, input$hour_local, input$minute_local, input$lat, input$lon, input$tz_offset)
+    # Convert to day of year
+    d <- as.Date(input$date_local)
+    doy <- as.integer(strftime(d, format = "%j"))
+    # Fractional hour local
+    local_time <- input$hour_local + input$minute_local/60
+    # Fractional year gamma (radians) (NOAA approximate)
+    gamma <- 2*pi/365 * (doy - 1 + (local_time - 12)/24)
+    # Equation of time (minutes)
+    eqtime <- 229.18 * (0.000075 + 0.001868*cos(gamma) - 0.032077*sin(gamma) - 0.014615*cos(2*gamma) - 0.040849*sin(2*gamma))
+    # Solar declination (radians)
+    decl <- 0.006918 - 0.399912*cos(gamma) + 0.070257*sin(gamma) - 0.006758*cos(2*gamma) + 0.000907*sin(2*gamma) - 0.002697*cos(3*gamma) + 0.00148*sin(3*gamma)
+    # Time offset (minutes)
+    time_offset <- eqtime + 4*input$lon - 60*input$tz_offset
+    # True solar time (minutes)
+    tst <- local_time * 60 + time_offset
+    # Hour angle (deg)
+    ha <- (tst / 4) - 180
+    # Convert degrees to radians for lat and hour angle
+    lat_rad <- input$lat * pi/180
+    ha_rad <- ha * pi/180
+    # Solar zenith angle (radians)
+    cos_zen <- sin(lat_rad)*sin(decl) + cos(lat_rad)*cos(decl)*cos(ha_rad)
+    cos_zen <- max(-1,min(1,cos_zen))
+    zen_rad <- acos(cos_zen)
+    zen_deg <- zen_rad * 180/pi
+    # Solar elevation
+    elev_deg <- 90 - zen_deg
+    # Update slider
+    updateSliderInput(session, "sza", value = round(zen_deg,2))
+    output$solar_pos <- renderPrint({
+      cat("Solar position (NOAA algorithm):\n")
+      cat(sprintf("  Day of year = %d\n", doy))
+      cat(sprintf("  Equation of time (min) = %.2f\n", eqtime))
+      cat(sprintf("  Declination (deg) = %.2f\n", decl*180/pi))
+      cat(sprintf("  Hour angle (deg) = %.2f\n", ha))
+      cat(sprintf("  Solar zenith (deg) = %.2f\n", zen_deg))
+      cat(sprintf("  Solar elevation (deg) = %.2f\n", elev_deg))
+      cat("(Slider 'Solar zenith angle' updated.)\n")
+    })
+  })
   
   # reactive LAI - explicit name to avoid confusion with other 'LAI' symbols
   LAI_val_reactive <- reactive({
@@ -140,16 +217,45 @@ server <- function(input, output, session) {
       }
     }
     
-    # absorbed direct if available
+    # absorbed direct / hemispherical if available
     I_abs_dir <- ifelse(!is.null(Ref$abs_dir), as.numeric(Ref$abs_dir), NA_real_)
-    
-    # beam transmittance estimate from fcover (vignette: fcover = 1 - beam transmittance)
-    beam_trans <- NA_real_
-    if (!is.null(Ref$fcover)) {
-      beam_trans <- as.numeric(1 - Ref$fcover)
-      # clip to [0,1]
-      beam_trans <- max(0, min(1, beam_trans))
+    # Hemispherical (all-direction) absorbed fraction (preferred for Beer-Lambert F)
+    Abs_hem <- NA_real_
+    if (!is.null(Ref$abs_hem)) {
+      # Some versions may return a scalar; if vector, average over PAR
+      if (length(Ref$abs_hem) == 1) {
+        Abs_hem <- as.numeric(Ref$abs_hem)
+      } else if (exists("par_mask")) {
+        # if spectral length matches wavelengths mask
+        if (length(Ref$abs_hem) == length(wvl)) {
+          Abs_hem <- mean(Ref$abs_hem[par_mask], na.rm = TRUE)
+        } else {
+          Abs_hem <- mean(Ref$abs_hem, na.rm = TRUE)
+        }
+      }
     }
+    
+    # Compute fAPAR if function available (prosail >= versions providing Compute_fAPAR)
+    fAPAR <- NA_real_
+    if ("Compute_fAPAR" %in% ls("package:prosail")) {
+      fAPAR <- tryCatch({
+        Compute_fAPAR(abs_dir = Ref$abs_dir,
+                      abs_hem = Ref$abs_hem,
+                      tts = as.numeric(input$sza))
+      }, error = function(e) NA_real_)
+      if (!is.null(fAPAR) && length(fAPAR) > 1) fAPAR <- fAPAR[1]
+    }
+
+  # beam transmittance: single source policy -> always use fAPAR when available (legacy)
+    beam_trans <- NA_real_
+    source_used <- "fAPAR"
+    if (!is.na(fAPAR)) {
+      beam_trans <- 1 - fAPAR
+    } else if (!is.null(Ref$fcover)) { # fallback only if fAPAR unavailable
+      beam_trans <- as.numeric(1 - Ref$fcover)
+      source_used <- "fcover(fallback)"
+    }
+    if (!is.na(beam_trans)) beam_trans <- max(0, min(1, beam_trans))
     
     # alternative I_t (from I_r and I_abs_dir if both present)
     I_t_alt <- NA_real_
@@ -160,8 +266,20 @@ server <- function(input, output, session) {
     # compute k if LAI > 0
     k_from_beam <- NA_real_
     k_from_alt <- NA_real_
+    k_from_abs_hem <- NA_real_
+    if (!is.na(Abs_hem) && is.finite(Abs_hem) && LAI_val > 0) {
+      # Beer-Lambert: F = Abs_hem = 1 - exp(-k * LAI) ⇒ k = -ln(1 - F)/LAI
+      if (Abs_hem >= 1) {
+        k_from_abs_hem <- Inf
+      } else if (Abs_hem <= 0) {
+        k_from_abs_hem <- 0
+      } else {
+        k_from_abs_hem <- -log(1 - Abs_hem)/LAI_val
+      }
+    }
     if (!is.na(beam_trans) && LAI_val > 0) {
-      if (beam_trans > 0) k_from_beam <- -log(beam_trans) / LAI_val else k_from_beam <- Inf
+      eps <- 1e-8
+      if (beam_trans > eps) k_from_beam <- -log(beam_trans) / LAI_val else k_from_beam <- Inf
     }
     if (!is.na(I_t_alt) && is.finite(I_t_alt) && LAI_val > 0) {
       if (I_t_alt > 0) k_from_alt <- -log(I_t_alt) / LAI_val else k_from_alt <- Inf
@@ -176,15 +294,19 @@ server <- function(input, output, session) {
       fcover_est_k_alt <- 1 - beam_trans_est_k_alt
     }
     
-    list(Ref = Ref,
+  list(Ref = Ref,
          wavelengths = wvl,
          par_mask = par_mask,
          I_r = I_r,
          I_abs_dir = I_abs_dir,
+         Abs_hem = Abs_hem,
          beam_trans = beam_trans,
          I_t_alt = I_t_alt,
          k_from_beam = k_from_beam,
          k_from_alt = k_from_alt,
+         k_from_abs_hem = k_from_abs_hem,
+     fAPAR = fAPAR,
+         beam_source = source_used,
          fcover_est_k_alt = fcover_est_k_alt,
          beam_trans_est_k_alt = beam_trans_est_k_alt,
          LAI_val = LAI_val)
@@ -200,83 +322,117 @@ server <- function(input, output, session) {
     cat("Derived inputs & results:\n")
     cat(sprintf("  LAI (plants/m² × leaf area per plant) = %.4f\n", res$LAI_val))
     cat("\nPRO4SAIL scalar outputs (if available):\n")
-    if (!is.null(res$Ref$fcover)) {
-      cat(sprintf("  fcover (fraction green cover) = %.4f\n", as.numeric(res$Ref$fcover)))
-      cat(sprintf("  beam_trans (1 - fcover) = %.4f\n", res$beam_trans))
+    if (!is.null(res$Ref$fcover)) cat(sprintf("  fcover (fraction green cover) = %.4f\n", as.numeric(res$Ref$fcover)))
+    if (!is.na(res$fAPAR)) {
+      cat(sprintf("  fAPAR (Compute_fAPAR; sole source for k) = %.4f\n", res$fAPAR))
     } else {
-      cat("  fcover not returned by PRO4SAIL\n")
-      if (!is.na(res$fcover_est_k_alt)) {
-        cat(sprintf("  fcover (estimated from k_alt & LAI) = %.4f\n", res$fcover_est_k_alt))
-        cat(sprintf("  beam_trans (estimated) = %.4f\n", res$beam_trans_est_k_alt))
-      }
+      cat("  fAPAR not available; USING fcover as temporary fallback for k.\n")
+    }
+    if (!is.na(res$beam_trans)) cat(sprintf("  beam_trans (1 - source) = %.4f  [source=%s]\n", res$beam_trans, res$beam_source))
+    if (is.na(res$fAPAR) && is.null(res$Ref$fcover) && !is.na(res$fcover_est_k_alt)) {
+      cat(sprintf("  fcover (estimated from k_alt & LAI) = %.4f\n", res$fcover_est_k_alt))
+      cat(sprintf("  beam_trans (estimated) = %.4f\n", res$beam_trans_est_k_alt))
     }
     if (!is.na(res$I_abs_dir)) cat(sprintf("  abs_dir (absorptance for direct flux) = %.4f\n", res$I_abs_dir)) else cat("  abs_dir not returned\n")
     if (!is.na(res$I_r)) cat(sprintf("  I_r (PAR-averaged rsdt) = %.4f\n", res$I_r)) else cat("  I_r not computed (rsdt missing)\n")
     
     cat("\nEstimated extinction coefficients k (Beer-Lambert):\n")
-    if (!is.na(res$k_from_beam)) {
-      cat(sprintf("  k (from fcover → beam_trans) = %.4f\n", res$k_from_beam))
+    if (!is.na(res$k_from_abs_hem)) {
+      cat(sprintf("  k (from abs_hem; primary) = %s\n", ifelse(is.infinite(res$k_from_abs_hem), "Inf", sprintf("%.4f", res$k_from_abs_hem))))
     } else {
-      cat("  k (from fcover) not available\n")
+      cat("  k (abs_hem) not available\n")
+    }
+    if (!is.na(res$k_from_beam)) {
+      cat(sprintf("  k (from fAPAR/fcover beam trans) = %.4f\n", res$k_from_beam))
     }
     if (!is.na(res$k_from_alt)) {
       cat(sprintf("  k (from I_r/I_abs cross-check) = %.4f\n", res$k_from_alt))
-    } else {
-      cat("  k (from I_r/I_abs) not available\n")
     }
     
-    cat("\nInterpretation: k is the extinction coefficient for the direct beam under the chosen geometry and LAD.\n")
+  cat("\nInterpretation: k is the extinction coefficient for direct beam under current solar zenith and leaf angle distribution.\n")
+  cat("k may exceed 1 at high SZA or planophile canopies (G/µ_s > 1).\n")
   # Use is.null instead of is.na because Ref$fcover may be NULL (is.na(NULL) -> logical(0))
   if (is.null(res$Ref$fcover) && !is.na(res$fcover_est_k_alt)) {
       cat("fcover shown above is an inferred value assuming Beer-Lambert and fcover ≈ 1 - exp(-k*LAI).\n")
     }
   })
+
+  # Field measurement calculations
+  output$field_calc <- renderPrint({
+    Io <- input$Io_field; Ir <- input$Ir_field; Ic <- input$Ic_field; LAI_f <- input$LAI_field
+    if (all(is.na(c(Io,Ir,Ic,LAI_f)))) {
+      cat("(Enter field measurements above to compute intercepted fraction and k_field)\n"); return()
+    }
+    if (any(is.na(c(Io,Ir,Ic))) || is.na(LAI_f) || LAI_f <= 0) {
+      cat("Provide Io, Ir, Ic (>=0) and LAI_field > 0.\n"); return()
+    }
+    if (Io <= 0) { cat("Io must be > 0.\n"); return() }
+    avail <- Io - Ir
+    if (avail <= 0) { cat("Io - Ir must be > 0 (otherwise reflected >= incoming).\n"); return() }
+    F_im <- ((Io - Ir) - Ic) / Io
+    F_im <- max(0, min(1, F_im))
+    k_field <- NA_real_
+    if (Ic > 0) {
+      ratio <- Ic / avail
+      ratio <- max(1e-12, min(1, ratio))
+      k_field <- -log(ratio) / LAI_f
+    } else {
+      k_field <- Inf
+    }
+    cat("Field-derived metrics (with reflection correction):\n")
+    cat(sprintf("  Intercepted fraction F_im = %.4f\n", F_im))
+    cat(sprintf("  k_field = %s\n", ifelse(is.infinite(k_field), "Inf (complete interception)", sprintf("%.4f", k_field))))
+    if (F_im < 0.01) cat("  (Very low interception; check sensor alignment.)\n")
+    if (F_im > 0.99) cat("  (Near-total interception; k may appear very large.)\n")
+  })
   
   output$specPlot <- renderPlot({
-    res <- prosail_result()
-    req(res)  # require result present
-    # choose spectral reflectance to plot
-    spec_vec <- NULL
-    lab <- ""
-    if (!is.null(res$Ref$rddt)) {
-      spec_vec <- res$Ref$rddt; lab <- "rddt (bi-hemispherical)"
-    } else if (!is.null(res$Ref$rsdt)) {
-      spec_vec <- res$Ref$rsdt; lab <- "rsdt (directional-hemispherical)"
-    }
-    
-    if (is.null(spec_vec)) {
-      plot.new(); text(0.5,0.5,"No spectral reflectance returned to plot", cex = 1.2)
-      return()
-    }
-    
-    # ensure wavelengths length match, else make index
-    if (length(spec_vec) == length(res$wavelengths)) {
-      df <- data.frame(wvl = res$wavelengths, refl = spec_vec)
-    } else {
-      df <- data.frame(wvl = seq_len(length(spec_vec)), refl = spec_vec)
-    }
-    ggplot(df, aes(x = wvl, y = refl)) +
-      geom_line() +
-      geom_vline(xintercept = c(400,700), linetype = "dashed", alpha = 0.4) +
-      labs(x = "Wavelength (nm)", y = "Reflectance", title = paste("Simulated spectral reflectance —", lab)) +
-      theme_minimal()
+    res <- prosail_result(); req(res)
+    R <- NULL; T <- NULL; label_mode <- ""
+    if (!is.null(res$Ref$rddt)) { R <- res$Ref$rddt; label_mode <- "bi-hemispherical"; if (!is.null(res$Ref$tddt)) T <- res$Ref$tddt }
+    else if (!is.null(res$Ref$rsdt)) { R <- res$Ref$rsdt; label_mode <- "directional-hemispherical"; if (!is.null(res$Ref$tsdt)) T <- res$Ref$tsdt }
+    if (is.null(R)) { plot.new(); text(0.5,0.5,"No spectral data", cex=1.2); return() }
+    wv <- if (length(R) == length(res$wavelengths)) res$wavelengths else seq_len(length(R))
+    R[!is.finite(R)] <- NA
+    have_T <- !is.null(T) && length(T) == length(R)
+    if (have_T) T[!is.finite(T)] <- NA else T <- rep(NA_real_, length(R))
+    A <- if (have_T) { tmp <- 1 - R - T; tmp[tmp<0] <- 0; tmp[tmp>1] <- 1; tmp } else rep(NA_real_, length(R))
+    df <- data.frame(wvl = wv, Reflectance = R, Transmittance = T, Absorptance = A)
+    keep <- names(df)[colSums(!is.na(df)) > 1]
+    df_long <- tidyr::pivot_longer(df[, keep, drop = FALSE], cols = -wvl, names_to = "Quantity", values_to = "Value")
+    df_long <- df_long[is.finite(df_long$Value), ]
+    title_txt <- paste("Canopy spectra —", label_mode)
+    ggplot(df_long, aes(x = wvl, y = Value, colour = Quantity)) +
+      geom_line(linewidth = 0.7, na.rm = TRUE) +
+      geom_vline(xintercept = c(400,700), linetype = "dashed", alpha = 0.35) +
+      labs(x = "Wavelength (nm)", y = "Fraction", title = title_txt, colour = "") +
+      theme_minimal(base_size = 11) + theme(legend.position = "bottom")
   })
   
   output$kLAIPlot <- renderPlot({
-    res <- prosail_result()
-    req(res)
-    k_use <- if (!is.na(res$k_from_beam)) res$k_from_beam else res$k_from_alt
-    if (is.na(k_use)) {
-      plot.new(); text(0.5,0.5,"k not available yet (run PRO4SAIL to compute).", cex = 1.2); return()
-    }
+    res <- prosail_result(); req(res)
+    k_primary <- res$k_from_abs_hem
+    k_secondary <- res$k_from_beam
+    ks <- c(k_primary, k_secondary, res$k_from_alt)
+    names(ks) <- c("k_abs_hem", "k_beam", "k_alt")
+    ks <- ks[!is.na(ks) & is.finite(ks)]
+    if (length(ks) == 0) { plot.new(); text(0.5,0.5,"k not available yet (run PRO4SAIL).", cex=1.2); return() }
     LAI_vals <- seq(0, 8, length.out = 201)
-    trans <- exp(-k_use * LAI_vals)
-    df2 <- data.frame(LAI = LAI_vals, trans = trans)
-    ggplot(df2, aes(x = LAI, y = trans)) +
-      geom_line() +
-      labs(x = "LAI", y = "Transmitted fraction I/I0 (direct beam approx)",
-           title = sprintf("Transmitted fraction vs LAI (k = %.3f)", k_use)) +
-      theme_minimal()
+    build_curve <- function(k){
+      if (is.infinite(k) || k > 50) return(ifelse(LAI_vals==0,1,0))
+      exp(-k * LAI_vals)
+    }
+    df_list <- lapply(names(ks), function(nm){ data.frame(LAI = LAI_vals, trans = build_curve(ks[[nm]]), source = nm) })
+    df_plot <- do.call(rbind, df_list)
+    source_labs <- c(k_abs_hem = "abs_hem", k_beam = "fAPAR/fcover", k_alt = "I_r/I_abs")
+    cols <- c(k_abs_hem = "#7570b3", k_beam = "#1b9e77", k_alt = "#d95f02")
+    ggplot(df_plot, aes(x = LAI, y = trans, colour = source)) +
+      geom_line(linewidth = 0.9) +
+      scale_colour_manual(values = cols, labels = source_labs[names(cols) %in% unique(df_plot$source)]) +
+      labs(x = "LAI", y = "Transmitted fraction I/I0", colour = "k source",
+           title = "Transmitted fraction vs LAI for available k estimates") +
+      theme_minimal() +
+      theme(legend.position = "bottom")
   })
 }
 
